@@ -1,0 +1,224 @@
+/*
+ * ==========================================================================================
+ * PROJECT      : Team AVEON Racing - e-ATV Vehicle Control Unit (VCU) Firmware
+ * CORE UNIT    : ATmega328P (Custom Controller Architecture)
+ * COMPLIANCE   : e-BAJA SAE India Powertrain Interlocking & Safety Regulations
+ * REVISION     : 2.1 (Production Ruggedized - Watchdog & Soft-Start Enabled)
+ * ==========================================================================================
+ */
+
+#include <Arduino.h>
+#include <avr/wdt.h> 
+
+// ================================================================================
+// 1. HARDWARE PIN CONFIGURATION
+// ================================================================================
+// Conditioned Sensor Inputs (Analog Pins acting as protected digital/analog inputs)
+const int PIN_START_BTN = A0; 
+const int PIN_KILL      = A1; // Safety Interlock Loop: 5V = Safe, 0V = E-Stop / Open Loop
+const int PIN_ACCEL     = A2; // Hall Effect Throttle Pedal Voltage (Analog Signal)
+const int PIN_BRAKE     = A3; 
+const int PIN_REVERSE   = A4; 
+const int PIN_NEUTRAL   = A5; 
+
+// Actuator & Signal Relay Outputs (Active LOW Configuration via Drivers)
+const int PIN_TSAL        = 2; // Tractive System Active Light Relay
+const int PIN_REV_LIGHT   = 3; // Reverse Indicator Light Relay
+const int PIN_CONTACT     = 4; // Main Accumulator Isolation Relay (AIR) Contactor Line
+const int PIN_BRAKE_LIGHT = 5; // Rear Brake Light Strip Relay
+const int PIN_RTDS        = 6; // Ready-To-Drive Sound Acoustic Buzzer Relay
+
+// ================================================================================
+// 2. CALIBRATION & TIMING PARAMETERS
+// ================================================================================
+const int FSR_IDLE_THRESHOLD  = 300; // Safe ADC threshold boundary to prevent runaway on startup
+const unsigned long SWITCH_DELAY = 100; // Structural delay window between successive relay actions (ms)
+
+// Telemetry & Safety Automation Timing Specs
+const unsigned long TSAL_ACTIVE_MS   = 1000; 
+const unsigned long TSAL_RESET_MS    = 100;  
+const unsigned long RTDS_DURATION    = 2000; // SAE-mandated acoustic alert run length (2 seconds)
+const unsigned long REV_BEEP_INTERVAL = 500;  
+
+// ================================================================================
+// 3. SYSTEM STATE STORAGE REGISTER
+// ================================================================================
+// Virtual tracking variables storing physical relay positions to block redundant code pulses
+int stateBrakeLight = HIGH;
+int stateRevLight   = HIGH;
+int stateContact    = HIGH;
+int stateTsal       = HIGH;
+int stateRtds       = HIGH;
+
+// Operational Flags
+bool vehicleActive       = false;       
+bool rtdsActive          = false;          
+unsigned long rtdsStartTime      = 0;  
+unsigned long lastRevBeepTime    = 0; 
+unsigned long lastTsalSwitchTime = 0;
+bool tsalRelayState      = HIGH; 
+int revBeepState         = HIGH; 
+
+// Power stabilization tracker to distribute transient current draws evenly
+unsigned long lastRelayActionTime = 0; 
+
+// ================================================================================
+// 4. POWER-SAVING & TRANS-RESPONSE CONTROLLER LAYER (SOFT START)
+// ================================================================================
+void requestWrite(int pin, int &currentState, int newState) {
+  // If the target hardware profile is already established, drop out immediately
+  if (currentState == newState) return;
+
+  // Staggering Protection Logic: Blocks multi-relay execution overlap
+  if (millis() - lastRelayActionTime < SWITCH_DELAY) {
+    return; // Defer action to subsequent runtime ticks to balance power converter load
+  }
+
+  // Commit output shift safely
+  digitalWrite(pin, newState);
+  currentState = newState;
+  lastRelayActionTime = millis(); // Refresh power-stabilization timestamp
+  
+  wdt_reset(); // Pet the hardware watchdog window upon handling load changes successfully
+}
+
+// ================================================================================
+// 5. CORE SYSTEM HARDWARE CONFIGURATION
+// ================================================================================
+void setup() {
+  // Prime the hardware watchdog protection system for a tight 2-second system halt reset limit
+  wdt_enable(WDTO_2S);
+
+  // Initialize Input Interfaces
+  pinMode(PIN_KILL, INPUT);
+  pinMode(PIN_START_BTN, INPUT); 
+  pinMode(PIN_ACCEL, INPUT); 
+  pinMode(PIN_BRAKE, INPUT);
+  pinMode(PIN_REVERSE, INPUT);
+  pinMode(PIN_NEUTRAL, INPUT);
+
+  // Initialize Output Drive Interfaces
+  pinMode(PIN_BRAKE_LIGHT, OUTPUT);
+  pinMode(PIN_TSAL, OUTPUT);
+  pinMode(PIN_REV_LIGHT, OUTPUT);
+  pinMode(PIN_RTDS, OUTPUT);
+  pinMode(PIN_CONTACT, OUTPUT);
+
+  // Enforce Absolute Failsafe Initial Isolation States (Outputs HIGH = Relays Open / De-energized)
+  digitalWrite(PIN_CONTACT, HIGH);      
+  digitalWrite(PIN_TSAL, HIGH);         
+  digitalWrite(PIN_RTDS, HIGH);         
+  digitalWrite(PIN_BRAKE_LIGHT, HIGH);  
+  digitalWrite(PIN_REV_LIGHT, HIGH);    
+  
+  Serial.begin(9600);
+}
+
+// ================================================================================
+// 6. CONTINUOUS EXECUTIVE RUNTIME PROCESSING LOOP
+// ================================================================================
+void loop() {
+  wdt_reset(); // Reset internal watchdog counter to confirm baseline stability
+  
+  // Anti-Freeze Trick: Repeatedly hardwire ADC activation flags against EMI-induced bit slips
+  ADCSRA |= (1 << ADEN); 
+
+  // --- SENSOR ACQUISITION LOGIC ---
+  bool isStartPressed = (digitalRead(PIN_START_BTN) == HIGH); 
+  bool isKillPressed  = (digitalRead(PIN_KILL) == LOW); // Hardware interlock break pulls pin to 0V
+  bool isBrakePressed = (digitalRead(PIN_BRAKE) == HIGH);
+  bool isNeutral      = (digitalRead(PIN_NEUTRAL) == HIGH);
+  bool isReverse      = (digitalRead(PIN_REVERSE) == HIGH);
+  
+  int accelRaw = analogRead(PIN_ACCEL);
+  bool isThrottleZero = (accelRaw > FSR_IDLE_THRESHOLD); 
+
+  // --- LIGHTING AUTOMATION DEPLOYMENT ---
+  if (isBrakePressed) {
+    requestWrite(PIN_BRAKE_LIGHT, stateBrakeLight, LOW); 
+  } else {
+    requestWrite(PIN_BRAKE_LIGHT, stateBrakeLight, HIGH);
+  }
+
+  // --- RTDS & AUDIO SIGNAL MONITORING SEQUENCE ---
+  int targetRtds = HIGH; 
+
+  if (rtdsActive && !isKillPressed) {
+    if (millis() - rtdsStartTime < RTDS_DURATION) {
+      targetRtds = LOW; 
+    } else { 
+      rtdsActive = false; 
+      targetRtds = HIGH; 
+    }
+  } 
+  else if (vehicleActive && isReverse && !isKillPressed) {
+    if (millis() - lastRevBeepTime >= REV_BEEP_INTERVAL) {
+      lastRevBeepTime = millis();
+      revBeepState = (revBeepState == HIGH) ? LOW : HIGH;
+    }
+    targetRtds = revBeepState;
+  } 
+  else {
+    targetRtds = HIGH; 
+    revBeepState = HIGH; 
+  }
+  requestWrite(PIN_RTDS, stateRtds, targetRtds);
+
+  // --- EMERGENCY SHUTDOWN SAFETY CRITICAL OVERRIDE ---
+  if (isKillPressed) {
+    vehicleActive = false; 
+    requestWrite(PIN_CONTACT, stateContact, HIGH);   // Force High Voltage Contactor Open
+    requestWrite(PIN_TSAL, stateTsal, HIGH);      
+    requestWrite(PIN_REV_LIGHT, stateRevLight, HIGH); 
+    rtdsActive = false;
+  }
+
+  // --- HIGH-VOLTAGE TRACTIVE SEQUENCING SEQUENCE INTERLOCKS ---
+  else if (!vehicleActive) {
+    // Rigid multi-point safety validation matrix to verify cockpit integrity before driving
+    if (isNeutral && isBrakePressed && isThrottleZero && !isReverse && isStartPressed) {
+      vehicleActive = true; 
+      requestWrite(PIN_CONTACT, stateContact, LOW); // Energize primary contactor coils
+      rtdsActive = true;
+      rtdsStartTime = millis();
+      lastTsalSwitchTime = millis();
+      tsalRelayState = LOW; 
+    }
+  }
+
+  // --- TELEMETRY DRIVE ROUTINES ---
+  if (vehicleActive) {
+    requestWrite(PIN_CONTACT, stateContact, LOW); // Maintain power to Tractive Circuit Loop
+
+    if (isReverse && !isKillPressed) {
+      requestWrite(PIN_REV_LIGHT, stateRevLight, LOW); 
+    } else {
+      requestWrite(PIN_REV_LIGHT, stateRevLight, HIGH); 
+    }
+
+    // High Voltage Status Tractive Active Light (TSAL) Flashing Mechanism
+    unsigned long tsalCurrentTime = millis();
+    int targetTsal = tsalRelayState;
+    
+    if (tsalRelayState == LOW) {
+      if (tsalCurrentTime - lastTsalSwitchTime >= TSAL_ACTIVE_MS) {
+        lastTsalSwitchTime = tsalCurrentTime;
+        tsalRelayState = HIGH; 
+        targetTsal = HIGH;
+      }
+    } else {
+      if (tsalCurrentTime - lastTsalSwitchTime >= TSAL_RESET_MS) {
+        lastTsalSwitchTime = tsalCurrentTime;
+        tsalRelayState = LOW; 
+        targetTsal = LOW;
+      }
+    }
+    requestWrite(PIN_TSAL, stateTsal, targetTsal);
+    
+  } else {
+    // Redundant baseline sweep ensuring absolute HV vehicle safety during cold standby
+    requestWrite(PIN_CONTACT, stateContact, HIGH);
+    requestWrite(PIN_TSAL, stateTsal, HIGH);
+    requestWrite(PIN_REV_LIGHT, stateRevLight, HIGH);
+  }
+}
