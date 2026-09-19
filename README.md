@@ -1,4 +1,4 @@
-# Team AVEON Racing — e-ATV Vehicle Control Unit (VCU)
+# e-ATV Vehicle Control Unit (VCU)
 
 ## What this is
 
